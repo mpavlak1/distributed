@@ -1,0 +1,113 @@
+netio namespace provides functions used to set up distibuted networks.
+
+======================================== Remote Evaluation (RPC) ==================================
+Data is passed through sockets using buffered object input/output streams.
+Most clojure structures are already serializable, the only things that are not are references (atoms, agents, ...)
+
+All functions that require communications are built using the functios write-to-socket and read-from-socket.
+The input sockets come from either creating a new socket that connects to a host using the ->socket function, or from accepting connections on the server socket.
+Each instance of the netio namespace binds its server socket atom (ssock) at start up. 
+***When debug is true, all sockets use local-host.
+
+Incomming messages are put into the messages atom (vector).
+The listen-for-messages function continously accepts incomming connections and reading all contents from input stream and putting into messages.
+*The listen? boolean atom is used to stop the thread. listen-for-messages returns a future that will run in the background and only return a value when listen? is set to false to kill the thread.
+
+The eval-messages function will create another continous background process that is returned in a future (thread killed by listen?).
+Each namespace instance has an atom for id and hash-map atom for remote returns.
+Remote returns map has keys id and values of results from remote evaluations.
+Each message is expected to have the following map:
+	:return - when true, will add the value that was remotely evaluated to the instance that initially called the function
+		- when false, will evaluate the function remotely and not send a return message
+	:id - the id of the message
+	:fn - the function that will be evaluatated 
+		*if evaluating remotely, have to quote functions so that evaluation is delayed until delived to remote instance.
+		*can use a combination of list and quotes inside the list to remotely evaluate using both remote and local variables
+		**Example:	if in instance A, x is defined as 1 and in instance B, x defined as 2
+				sending the message: {:return true, :id 12345, :fn (list '+ 'x x)} from A to B will return the value 3 (local x (1) + remote x (2)) back to A.
+
+When :return is true, the remote instance will return the message {:return false, :id N, :fn (list 'swap! 'remote-returns 'asssoc N (eval (:fn m))}
+On the local instance, this will add the result of the remote evaluation to the remote-returns map with the key id.
+
+The waiting atom is a hash-map containing keys of message-ids and values of latch-locks.
+A watcher waits for changes to occur on remote-returns. When there is a new value, the latch-lock is decreased to zero, notifying any threads waiting for the results of the remote call.
+
+The wait for return function takes the message-id and a maximum wait time.
+This function waits for the lock in waiting to be released. When released, the value is retrieved from remote-returns. Returned messages are removed from waiting and remote-returns when done.
+If the lock is not released within the maximum wait time, it is assumed the message was dropped and returns nil to signify a timeout. 
+
+remote is the high-level function that allows calls to be evaluated on remote instances. 
+The port and host specify the remote instance. 
+The literal-fn is what will be evaluated on the remote instance (quoted function). 
+If the function has side effects and does not return a value, the return option can be set to false
+remote will wait for 'timeout' ms before aborting and returning nil.
+===================================================================================================			
+
+======================================== Connecting to a Coordinator ==============================
+Each instance can specify the details of a 'leader' node: atom vector with first value as port and second as ip address of host.
+When current instance is leader and follower nodes are connected, they will be listed in the connections set (atom).
+	Each connections is a vector where first is the port and second is the InetAddress object
+The connect function is used by clients connect to a leader node. This will register themselves in the leader's connection set and set the follower's leader.
+The disconnect function notifies the leader the follower has disconnected and removes iteself form the leader's connection set. The follower's leader is set to nil.
+===================================================================================================
+
+======================================== Transactions/Consistent Commits ==========================
+Transactions can be made to update the hash-map atom 'data' accross all nodes in the network.
+*Data should not contain large data as it is send to all nodes in the network, should only be used
+ to keep track of which nodes have what data stored locally.
+
+3-phase commits are supported using the three-phase-commit and request-3pc functions.
+The abort function is used to remove values from data (also called when failed attempt to finalize the commit).
+If the calling node is the leader, three-phase-commit can be called directly. 
+If the calling node is a follower, request-3pc (returns nil) has to be used to notify the leader to initaite a new transaction. 
+===================================================================================================
+
+======================================== Heat Beat Protocol =======================================
+The heart-beat function will ping the specified node every beat-time ms (each ping returns true). 
+If a response is not recived, the node will stop sending pings and call the timeout function.
+heart-beat returns a future which will contain a value upon timeout.
+
+start-heart-beat-on-new-leader will set up a watcher on leader that will initaite a new heart-beat protocol between follower and leader when leader is changed.
+ - When the follower does not recive a return response, it will disconnect itself.
+
+start-heart-beat-on-connect is a watcher on connections used by leader node to set up a heart-beat protocol when new node connect.
+ - When a response is no recived from follower, the leader removes it from its connection list and attempts to tell follower to disconnect.
+===================================================================================================
+
+======================================== Leader Coordination (Elections) ==========================
+
+netio namespace implements a dumb (error prone) way of holding elections. 
+*****This is only used as a proof of concept and should be replaced with a better consensous method (zookeeper/paxos)*****
+
+A new election is held anytime any node has a nil leader. 
+In practice, elections should only be held when a follower is leaderless and needs to contact the leader. 
+Being disconnected from leader but talking follower to follower is okay - no need for constant connection between followers and leader.
+
+=== Dumb Implementation ===
+leave-leadership is called when the leader is notified that followers cannot reach him and a new leader should be elected.
+ - this is done by using a shared file containing the leaders details that is periodly re-read (dumb implementation, real implementation would have all nodes connect to zookeeper server)
+ - zookeeper should include call-back for when node loses role as leader, which should be used to clean up former leader node.
+
+dumb-election is arbitrary method of determining a new leader. 
+If leader-file exist, read-it to get leader. If that leader cannot be reached, delete the file and re-call dumb-election
+If leader-file does not exist, claim leader role and write self to leader file.
+
+dumb-elections automatically tries to connect clients to new leader. This can be decoupled in real implementation.
+An election should only be held when a node needs to contact the leader.
+*define functions:
+(defn get-leader-port []
+	(if @leader
+		(.getPort @leader)
+		(do
+			(reset! leader (do-election)
+			(get-leader-port))))
+(defn get-leader-host []
+	...)
+
+When contacting leader:
+(some-function-that-calls-to-leader (get-leader-port) (get-leader-host) ...)
+
+***election-when-no-leader should not be used in real implementation, used as work-around for not having a coordination server and for testing re-elections.***
+Also, don't need to set up heart-beats between leader and follower
+(heart-beats should be set up between coordination server and all connected nodes)
+===================================================================================================
