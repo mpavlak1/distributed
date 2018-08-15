@@ -1,2 +1,7 @@
-# distributed
-project for distributed programming in clojure
+# temp
+
+A Clojure app to ... well, that part is up to you.
+
+## Usage
+
+FIXME
