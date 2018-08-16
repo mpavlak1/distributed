@@ -155,10 +155,10 @@
 
 ;;Disconnect for registered leader
 (defn disconnect []
-  (when (remote (first @leader) (ip->host (second @leader))
-          (list 'remove-connection (.getLocalPort @ssock)
-            (list 'ip->host (str (.getInetAddress @ssock)))))
-    (reset! leader nil)))
+  ;(when (remote (first @leader) (ip->host (second @leader))
+  ;        (list 'remove-connection (.getLocalPort @ssock)
+  ;          (list 'ip->host (str (.getInetAddress @ssock)))
+  (reset! leader nil))
 
 ;;=============== Election Coordination =============== 
 
@@ -332,7 +332,7 @@
       (when (and new (not (self-leader?)))
         (heart-beat (first new) (ip->host (second new)) beat-time 
           :timeout-fn #(do 
-                         (println "Disconnected from leader: " new) 
+                         ;(println "Disconnected from leader: " new) 
                          ;(disconnect)
                          (Thread/sleep (* 2 heart-beat-time))
                          (connect (leader-port) (leader-host))))))))
@@ -347,10 +347,11 @@
       (let [c (first (clojure.set/difference new old))]
         (when c
           (heart-beat (first c) (second c) beat-time 
-            :timeout-fn #(do (println c " has DISCONNECTED")
-                           (remote (first c) (second c) '(println "DISCONNECTED") :return false)
+            :timeout-fn #(do nil))))))) 
+;(println c " has DISCONNECTED"))))))))
+                           ;(remote (first c) (second c) '(println "DISCONNECTED") :return false)
                            ;(remote (first c) (second c) '(disconnect) :return false)
-                           (reset! connections (clojure.set/difference @connections #{c})))))))))
+                           ;(reset! connections (clojure.set/difference @connections #{c})))))))))
 ;(start-heart-beat-on-connect heart-beat-time)
 
 
