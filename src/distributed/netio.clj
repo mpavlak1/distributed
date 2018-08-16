@@ -1,5 +1,6 @@
 (ns distributed.netio
   (:require [clojure.set]))
+(defn rf [] (require 'distributed.netio :reload))
 
 ;;A namespace for evaluating functions remotely on clojure instances across the network
 
@@ -134,6 +135,9 @@
 ;;Port and Host of leader
 (def leader (atom nil))
 
+(defn leader-port [] (first @leader))
+(defn leader-host [] (ip->host (second @leader)))
+
 ;;Returns true when leader is equal to self
 (defn self-leader? []
   (and (= (.getLocalPort @ssock) (first @leader))
@@ -142,6 +146,11 @@
 ;;Set of connections [Port Host]
 (def connections (atom #{}))
 
+(defn ->connections [] 
+  (if (self-leader?)
+    (vec (map (fn [x] (vector (first x) (str (second x)))) @connections))
+    (remote (leader-port) (leader-host) '(->connections))))
+
 (defn add-connection [port host]
   (reset! connections (into @connections (hash-set [port host])))
   [(.getLocalPort @ssock) (str (.getInetAddress @ssock))])
@@ -149,9 +158,6 @@
 (defn remove-connection [port host]
   (reset! connections (clojure.set/difference @connections (hash-set [port host])))
   true)
-
-(defn leader-port [] (first @leader))
-(defn leader-host [] (ip->host (second @leader)))
 
 ;;Connect to leader on host/port
 (defn connect [port host]
@@ -367,3 +373,39 @@
   (reset! leader nil))
 
 (when start (start-up))
+
+;; =============== Distributed Mapping ===============
+
+;;Function to pass literal-fn to leader to eval
+(defn ->>> [literal-fn] 
+  (println literal-fn)
+  (eval (list 'remote (list 'leader-port) (list 'leader-host) (list 'quote literal-fn))))
+
+(defn remote-eval-partitions [fn-connections-map]
+  (map #(remote (first @connections) (second @connections) '(println "test 123")) @connections))
+
+(defn partition-work [seq connections]
+  (let [n (count seq) c (count connections)
+        parts (partition (int (/ n c)) seq)
+        left-over (concat (take-last (mod n c) seq) (repeat (- c (mod n c)) nil))]
+    (map #(filter identity (flatten %)) (vec (zipmap parts left-over)))))
+
+(defn ->workers-literals [fn seq connections & {:keys [pmap] :or {pmap false}}]
+  (let [workers (zipmap connections (partition-work seq connections))]
+    (for [w (keys workers)]
+      [w (list 'list (list 'quote (if pmap 'pmap 'map)) (list 'quote fn) (vec (get workers w)))])))
+
+;;Remote map: Distribute work to connections and return results.
+;;Uses same semantics as pmap: results will not be returned in any order - evaluations done in parallel
+;;Additioanlly if when processing localally, pmap should be used instead of map, set :pmap as true
+;;***When defining anonomous functions, have to use the lamda notation, not the #% macro
+;;Example: Does not work   -> (rmap #(+ 1 %) (range 10))
+;;         Works correctly -> (rmap '(fn [x] (+ 1 x)) (range 10) 
+;;         Also works      -> (rmap 'inc (range 10)
+(defn rmap [literal-fn seq & {:keys [pmap max-wait] :or {pmap false max-wait timeout}}]
+  (let [evals (->workers-literals literal-fn seq 
+                (map #(vector (first %) (ip->host (second %))) (->connections)) :pmap pmap)]
+    (reduce concat 
+      (map deref (map #(future (remote (ffirst %) (second (first %)) (last %))) evals)))))
+
+
