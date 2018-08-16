@@ -135,21 +135,8 @@
 ;;Port and Host of leader
 (def leader (atom nil))
 
-(defn leader-port [] (first @leader))
-(defn leader-host [] (ip->host (second @leader)))
-
-;;Returns true when leader is equal to self
-(defn self-leader? []
-  (and (= (.getLocalPort @ssock) (first @leader))
-       (= (.getInetAddress @ssock) (ip->host (second @leader)))))
-
 ;;Set of connections [Port Host]
 (def connections (atom #{}))
-
-(defn ->connections [] 
-  (if (self-leader?)
-    (vec (map (fn [x] (vector (first x) (str (second x)))) @connections))
-    (remote (leader-port) (leader-host) '(->connections))))
 
 (defn add-connection [port host]
   (reset! connections (into @connections (hash-set [port host])))
@@ -168,10 +155,83 @@
 
 ;;Disconnect for registered leader
 (defn disconnect []
-  (when (remote (leader-port) (leader-host) 
+  (when (remote (first @leader) (ip->host (second @leader))
           (list 'remove-connection (.getLocalPort @ssock)
             (list 'ip->host (str (.getInetAddress @ssock)))))
     (reset! leader nil)))
+
+;;=============== Election Coordination =============== 
+
+;;Election process function should be call back for missed heart beats to lookup or elect leader
+;;Dumb implementation of a persistent network using LEADER file as shared state.
+;;Real implementation should use zookeeper/paxos for leader consensous
+
+;;Dumb implemenation has potential infinite election cycles
+
+;;Function that node calls when lose role as leader node
+;;Tells all clients to disconnect and preform a new election
+(defn leave-leadership []
+  (println "No longer leader, electing new leader")
+  (remove-watch connections :new-connections)
+  (let [old-connections @connections]
+    (reset! connections #{})
+    (doall (for [c old-connections] (remote (first c) (second c) '(do (reset! leader nil) (self-leader?)) :return false)))
+    (Thread/sleep (* 2 heart-beat-time)))
+  (reset! leader nil))
+
+
+(def leader-file (str "." (java.io.File/separator) "LEADER"))
+
+;;Checks file to see if self is leader
+(defn dumb-leader-check [leader-file]
+  (when (.exists (clojure.java.io/as-file leader-file)) 
+    (let [e (clojure.string/split (slurp leader-file) #"\t")]
+         (and (= (last e) (str (.getInetAddress @ssock)))
+              (= (read-string (first e)) (.getLocalPort @ssock))))))
+
+;;Dumb implementation of election process, replace with real election coordinating function
+;;Attempts to read leader file. If it dose not exist, creates it and becomes leader node
+;;Leader file contains [Port ip-address of leader]
+(defn dumb-election [leader-file]
+  (let [new-leader (if (.exists (clojure.java.io/as-file leader-file))
+                     (let [e (clojure.string/split (slurp leader-file) #"\t")]
+                       [(read-string (first e)) (last e)])
+                     (do
+                       (spit leader-file (str (.getLocalPort @ssock) "\t" (str (.getInetAddress @ssock))))
+                       [(.getLocalPort @ssock) (str (.getInetAddress @ssock))]))]
+    (if (dumb-leader-check leader-file)
+      (do (future (do (while (dumb-leader-check leader-file) (Thread/sleep heart-beat-time)) 
+                      (leave-leadership)))
+        new-leader)
+      (do          
+        (when (not (try (remote (first new-leader) (ip->host (second new-leader)) 'true) 
+                        (catch Exception e nil)))
+          (do (.delete (clojure.java.io/as-file leader-file))
+              (dumb-election leader-file)))
+        (println "CONNECTING TO LEADER" new-leader)
+        (try 
+          (connect (first new-leader) (ip->host (second new-leader)))
+          (catch Exception e (do (println "Re-trying election") 
+                               (.delete (clojure.java.io/as-file leader-file))
+                               (dumb-election leader-file))))))))
+
+;;Preforms election when leader is nil
+(defn election-when-no-leader [])
+
+(defn leader-port [] (if @leader 
+                       (first @leader) 
+                       (do (reset! leader (dumb-election leader-file))
+                           (leader-port))))
+
+(defn leader-host [] (if @leader 
+                       (ip->host (second @leader))
+                       (do (reset! leader (dumb-election leader-file))
+                           (leader-host))))
+
+;;Returns true when leader is equal to self
+(defn self-leader? []
+  (and (= (.getLocalPort @ssock) (leader-port))
+       (= (.getInetAddress @ssock) (leader-host))))
 
 ;; =============== Consistent Commits ===============
 
@@ -202,7 +262,7 @@
   (if (self-leader?)
     (doseq [c @connections]
       (future (remote (first c) (second c) (list 'when (list 'swap! 'data 'dissoc key)))))
-    (remote (first @leader) (ip->host (second @leader)) (list 'abort key val)))
+    (remote (leader-port) (leader-host) (list 'abort key val)))
   (swap! data dissoc key))
 
 ;;Veryify that all clients have commited
@@ -249,7 +309,7 @@
 
 ;;Clients can ask leader to issue three phase commit on behalf of the client
 (defn request-3pc [key val]
-  (remote (first @leader) (ip->host (second @leader))
+  (remote (leader-port) (leader-host)
             (list 'swap! 'pending-commits 'conj [:3pc key val]) :return false))
 
 ;; =============== Heart Beat Protocol ===============
@@ -271,8 +331,12 @@
     (fn [k r old new]
       (when (and new (not (self-leader?)))
         (heart-beat (first new) (ip->host (second new)) beat-time 
-          :timeout-fn #(do (println "Disconnected from leader: " new) (disconnect)))))))
-
+          :timeout-fn #(do 
+                         (println "Disconnected from leader: " new) 
+                         ;(disconnect)
+                         (Thread/sleep (* 2 heart-beat-time))
+                         (connect (leader-port) (leader-host))))))))
+(start-heart-beat-on-new-leader heart-beat-time)
 
 ;;Starts up a heart-beat protocol when connecting to another node
 ;;When heart beat fails, tried to tell connection to disconnect and
@@ -287,81 +351,12 @@
                            (remote (first c) (second c) '(println "DISCONNECTED") :return false)
                            ;(remote (first c) (second c) '(disconnect) :return false)
                            (reset! connections (clojure.set/difference @connections #{c})))))))))
+;(start-heart-beat-on-connect heart-beat-time)
 
-
-
-;;=============== Election Coordination =============== 
-
-;;Election process function should be call back for missed heart beats to lookup or elect leader
-;;Dumb implementation of a persistent network using LEADER file as shared state.
-;;Real implementation should use zookeeper/paxos for leader consensous
-
-;;Dumb implemenation has potential infinite election cycles
-
-;;Function that node calls when lose role as leader node
-;;Tells all clients to disconnect and preform a new election
-(defn leave-leadership []
-  (println "No longer leader, electing new leader")
-  (remove-watch connections :new-connections)
-  (let [old-connections @connections]
-    (reset! connections #{})
-    (doall (for [c old-connections] (remote (first c) (second c) '(reset! leader nil))))
-    (Thread/sleep (* 2 heart-beat-time)))
-  (reset! leader nil))
-  
-
-(def leader-file (str "." (java.io.File/separator) "LEADER"))
-
-;;Checks file to see if self is leader
-(defn dumb-leader-check [leader-file]
-  (when (.exists (clojure.java.io/as-file leader-file)) 
-    (let [e (clojure.string/split (slurp leader-file) #"\t")]
-         (and (= (last e) (str (.getInetAddress @ssock)))
-              (= (read-string (first e)) (.getLocalPort @ssock))))))
-
-;;Dumb implementation of election process, replace with real election coordinating function
-;;Attempts to read leader file. If it dose not exist, creates it and becomes leader node
-;;Leader file contains [Port ip-address of leader]
-(defn dumb-election [leader-file]
-  (let [new-leader (if (.exists (clojure.java.io/as-file leader-file))
-                     (let [e (clojure.string/split (slurp leader-file) #"\t")]
-                       [(read-string (first e)) (last e)])
-                     (do
-                       (spit leader-file (str (.getLocalPort @ssock) "\t" (str (.getInetAddress @ssock))))
-                       [(.getLocalPort @ssock) (str (.getInetAddress @ssock))]))]
-    (if (dumb-leader-check leader-file)
-      (do (future (do (while (dumb-leader-check leader-file) (Thread/sleep heart-beat-time)) 
-                      (leave-leadership)))
-        new-leader)
-      (do          
-        (when (not (try (remote (first new-leader) (ip->host (second new-leader)) 'true) 
-                        (catch Exception e nil)))
-          (do (.delete (clojure.java.io/as-file leader-file))
-              (dumb-election leader-file)))
-        (println "CONNECTING TO LEADER" new-leader)
-        (try 
-          (connect (first new-leader) (ip->host (second new-leader)))
-          (catch Exception e (do (println "Re-trying election") 
-                               (.delete (clojure.java.io/as-file leader-file))
-                               (dumb-election leader-file))))))))
-
-;;Preforms election when leader is nil
-(defn election-when-no-leader []
-  (add-watch leader :election-process
-    (fn [k r old new]
-      (when (string? new) (reset! leader nil))
-      (when (nil? new)
-        (do
-          (remove-watch leader :leader-watch)
-          (let [new-leader (dumb-election leader-file)]
-            (reset! leader new-leader)
-            (if (self-leader?)
-              nil; clients responsible for disconnecting on timeout/partition (start-heart-beat-on-connect heart-beat-time)
-              (start-heart-beat-on-new-leader heart-beat-time))))))))
 
 (defn rejoin-network []
-  (election-when-no-leader)
-  (reset! leader nil))
+  (reset! leader nil)
+  (connect (leader-port) (leader-host)))
 
 ;;Leave network and don't attempt to re-connect
 (defn leave-network []
@@ -369,20 +364,21 @@
   (remove-watch leader :election-process))
   
 (defn start-up []
-  (election-when-no-leader)
-  (reset! leader nil))
+  (reset! leader nil)
+  (connect (leader-port) (leader-host)))
 
 (when start (start-up))
 
 ;; =============== Distributed Mapping ===============
 
+(defn ->connections [] 
+  (if (self-leader?)
+    (vec (map (fn [x] (vector (first x) (str (second x)))) @connections))
+    (remote (leader-port) (leader-host) '(->connections))))
+
 ;;Function to pass literal-fn to leader to eval
 (defn ->>> [literal-fn] 
-  (println literal-fn)
   (eval (list 'remote (list 'leader-port) (list 'leader-host) (list 'quote literal-fn))))
-
-(defn remote-eval-partitions [fn-connections-map]
-  (map #(remote (first @connections) (second @connections) '(println "test 123")) @connections))
 
 (defn partition-work [seq connections]
   (let [n (count seq) c (count connections)
