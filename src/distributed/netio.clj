@@ -77,11 +77,11 @@
   (future (while @listen? ;;Might be able to use watcher here instead, but this works for now
             (let [m (pop-message)]
               (if (:return m)
-                (write-to-socket (->socket (:port m) (:host m))
-                  {:id (:id m) 
-                   :fn (list 'swap! 'remote-returns 'assoc (:id m) (try (eval (:fn m))
-                                                                     (catch Exception e (.getMessage e))))})
-                (try (eval (:fn m)) (catch Exception e (.getMessage e)))) ;;Exceptions in background threads not displayed to REPL
+                  (write-to-socket (->socket (:port m) (:host m))
+                    {:id (:id m) 
+                     :fn (list 'swap! 'remote-returns 'assoc (:id m) (try (eval (:fn m))
+                                                                       (catch Exception e (.getMessage e))))})
+                  (try (eval (:fn m)) (catch Exception e (.getMessage e)))) ;;Exceptions in background threads not displayed to REPL
               (Thread/sleep 100)))))
 
 ;;Removes old values from remote-returns
@@ -104,7 +104,7 @@
   (let [t (future (Thread/sleep max-wait-ms) (.countDown (get @waiting id)))]
     (.await (get @waiting id))
     (let [r (get @remote-returns id)]
-      (swap! waiting dissoc id)
+      ;(swap! waiting dissoc id)
       r)))
 
 ;;literal-fn is a list of symbols that can be evaluated as a function
@@ -392,7 +392,7 @@
 (defn ->workers-literals [fn seq connections & {:keys [pmap] :or {pmap false}}]
   (let [workers (zipmap connections (partition-work seq connections))]
     (for [w (keys workers)]
-      [w (list 'list (list 'quote (if pmap 'pmap 'map)) (list 'quote fn) (vec (get workers w)))])))
+      [w (list 'quote (list 'into [] (list (if pmap 'pmap 'map) fn (vec (get workers w)))))])))
 
 ;;Remote map: Distribute work to connections and return results.
 ;;Uses same semantics as pmap: results will not be returned in any order - evaluations done in parallel
@@ -401,10 +401,10 @@
 ;;Example: Does not work   -> (rmap #(+ 1 %) (range 10))
 ;;         Works correctly -> (rmap '(fn [x] (+ 1 x)) (range 10) 
 ;;         Also works      -> (rmap 'inc (range 10)
-(defn rmap [literal-fn seq & {:keys [pmap max-wait] :or {pmap false max-wait timeout}}]
+(defn rmap [literal-fn seq & {:keys [pmap max-wait return] :or {pmap false max-wait timeout return true}}]
   (let [evals (->workers-literals literal-fn seq 
                 (map #(vector (first %) (ip->host (second %))) (->connections)) :pmap pmap)]
     (reduce concat 
-      (map deref (map #(future (remote (ffirst %) (second (first %)) (last %))) evals)))))
-
+      (map deref
+        (map #(future (remote (ffirst %) (second (first %)) (eval (last %)) :return return)) evals)))))
 
