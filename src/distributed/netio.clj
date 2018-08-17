@@ -396,11 +396,11 @@
 
 ;;Remote map: Distribute work to connections and return results.
 ;;Uses same semantics as pmap: results will not be returned in any order - evaluations done in parallel
-;;Additioanlly if when processing localally, pmap should be used instead of map, set :pmap as true
-;;***When defining anonomous functions, have to use the lamda notation, not the #% macro
-;;Example: Does not work   -> (rmap #(+ 1 %) (range 10))
-;;         Works correctly -> (rmap '(fn [x] (+ 1 x)) (range 10) 
-;;         Also works      -> (rmap 'inc (range 10)
+;;Additioanlly if when processing locally, pmap should be used instead of map, set :pmap as true
+;;Example:  -> (rmap '#(+ 1 %) (range 10))
+;;          -> (rmap '(fn [x] (+ 1 x)) (range 10) 
+;;          -> (rmap 'inc (range 10) *assuming the function is already defined on the otherside
+;; *Cannot pass function objects, evaluation of function objs has to be delayed using quotes
 (defn rmap [literal-fn seq & {:keys [pmap max-wait return] :or {pmap false max-wait timeout return true}}]
   (let [evals (->workers-literals literal-fn seq 
                 (map #(vector (first %) (ip->host (second %))) (->connections)) :pmap pmap)]
