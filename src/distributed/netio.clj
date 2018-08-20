@@ -4,7 +4,7 @@
 
 ;;A namespace for evaluating functions remotely on clojure instances across the network
 
-(def debug true) ;;when debug true, use local host only (for testing and devlopment)
+(def debug false);when debug true, use local host only (for testing and devlopment)
 (def timeout 3000) ;;time to wait for remote calls
 (def heart-beat-time 3000) ;;time to wait on each heart beat
 
@@ -14,7 +14,11 @@
 ;;Returns InetAddress of local address
 (defn host-address [] (java.net.InetAddress/getLocalHost))
 
-(defn ip->host [ip] (java.net.InetAddress/getByName (if debug nil ip)))
+(defn host->ip [host]
+  (last (clojure.string/split (str (host-address)) #"[/]")))
+
+(defn ip->host [ip] 
+  (java.net.InetAddress/getByName (if debug nil (first (clojure.string/split (str ip) #"[/]")))))
 
 (defn server-socket [port] 
   (let [ss (java.net.ServerSocket. port 0 (if debug (local-host) (host-address)))] ;;use host-address
@@ -81,7 +85,7 @@
                     {:id (:id m) 
                      :fn (list 'swap! 'remote-returns 'assoc (:id m) (try (eval (:fn m))
                                                                        (catch Exception e (do (println "REMOTE EXCEPTION, PASSING BACK TO SENDER") 
-                                                                                              (list 'Exception. (.getMessage e) (.getCause e))))))})
+                                                                                              (list 'Exception. (.getMessage e))))))})
                 (try (eval (:fn m)) (catch Exception e e))) ;;Exceptions in background threads not displayed to REPL
               (Thread/sleep 100)))))
 
@@ -117,8 +121,7 @@
     (write-to-socket (->socket port host) ;;Send message to remote
       {:return return
        :port (.getLocalPort @ssock)
-       :host (if debug (local-host) (java.net.InetAddress/getByName
-                                      (str (.getInetAddress @ssock))))
+       :host (if debug (local-host) (ip->host (str (.getInetAddress @ssock))))
        :id i
        :fn literal-fn})
     (dosync (swap! id inc)) ;;increase and return id
