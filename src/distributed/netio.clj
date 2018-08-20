@@ -80,8 +80,9 @@
                   (write-to-socket (->socket (:port m) (:host m))
                     {:id (:id m) 
                      :fn (list 'swap! 'remote-returns 'assoc (:id m) (try (eval (:fn m))
-                                                                       (catch Exception e (.getMessage e))))})
-                  (try (eval (:fn m)) (catch Exception e (.getMessage e)))) ;;Exceptions in background threads not displayed to REPL
+                                                                       (catch Exception e (do (println "REMOTE EXCEPTION, PASSING BACK TO SENDER") 
+                                                                                              (list 'Exception. (.getMessage e) (.getCause e))))))})
+                (try (eval (:fn m)) (catch Exception e e))) ;;Exceptions in background threads not displayed to REPL
               (Thread/sleep 100)))))
 
 ;;Removes old values from remote-returns
@@ -333,7 +334,7 @@
           :timeout-fn #(do 
                          (Thread/sleep (* 2 heart-beat-time))
                          (connect (leader-port) (leader-host))))))))
-(start-heart-beat-on-new-leader heart-beat-time)
+;(start-heart-beat-on-new-leader heart-beat-time)
 
 ;;Starts up a heart-beat protocol when connecting to another node
 ;;When heart beat fails, tried to tell connection to disconnect and
@@ -370,7 +371,8 @@
   (remove-watch remote-returns :remote-remover)
   (remove-watch pending-commits :p)
   (remove-watch leader :leader-watch)
-  (remove-watch connections :new-connections))
+  (remove-watch connections :new-connections)
+  nil)
 
 ;; =============== Distributed Mapping ===============
 
@@ -407,4 +409,5 @@
     (reduce concat 
       (map deref
         (map #(future (remote (ffirst %) (second (first %)) (eval (last %)) :return return)) evals)))))
+
 
